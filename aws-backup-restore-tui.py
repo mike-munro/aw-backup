@@ -643,6 +643,101 @@ def confirm_dialog(stdscr, title: str, detail_lines: list) -> bool:
             return False
 
 
+def show_restore_review(stdscr, title: str, sections: list, metadata: Dict) -> bool:
+    """Full-screen scrollable restore plan review.
+
+    sections: list of (section_title, [(label, value), ...])
+    metadata: the raw dict that will be sent to start_restore_job
+
+    Returns True if user confirms with y, False otherwise.
+    Scrollable with ↑/↓/PgUp/PgDn. y to confirm, n/q/Esc to cancel.
+    """
+    # Build flat line list from sections + metadata
+    lines: List[tuple] = []  # (text, attr_constant)
+
+    for sec_title, fields in sections:
+        lines.append((f"  {sec_title}", "header"))
+        lines.append(("  " + "─" * max(len(sec_title) + 2, 50), "dim"))
+        for label, value in fields:
+            lines.append((f"    {label:<26}  {value}", "field"))
+        lines.append(("", "dim"))
+
+    # Full metadata section
+    lines.append(("  FULL RESTORE METADATA  (sent to AWS Backup)", "header"))
+    lines.append(("  " + "─" * 52, "dim"))
+    for k, v in sorted(metadata.items()):
+        lines.append((f"    {k:<30}  {v}", "field"))
+    lines.append(("", "dim"))
+
+    offset = 0
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        draw_title_bar(stdscr, f"Restore Review  ─  {title}", aws.region)
+
+        content_top = 2
+        content_bot = h - 4  # leave room for confirm bar
+        visible = max(1, content_bot - content_top)
+
+        # Clamp offset
+        max_offset = max(0, len(lines) - visible)
+        offset = max(0, min(offset, max_offset))
+
+        for i in range(visible):
+            li = offset + i
+            if li >= len(lines):
+                break
+            text, kind = lines[li]
+            if kind == "header":
+                attr = curses.color_pair(C_HEADER) | curses.A_BOLD
+            elif kind == "dim":
+                attr = curses.color_pair(C_DIM)
+            else:
+                attr = curses.color_pair(C_MENU)
+            safe_addstr(stdscr, content_top + i, 0, str(text)[: w - 1], attr)
+
+        # Scroll indicator
+        if len(lines) > visible:
+            pct = offset / max(max_offset, 1)
+            sb_h = max(1, visible * visible // max(len(lines), 1))
+            sb_top = int(pct * (visible - sb_h))
+            for sb in range(visible):
+                ch = "█" if sb_top <= sb < sb_top + sb_h else "░"
+                safe_addstr(stdscr, content_top + sb, w - 1, ch, curses.color_pair(C_DIM))
+
+        # Confirm bar at bottom
+        safe_addstr(stdscr, h - 3, 2, "─" * (w - 4), curses.color_pair(C_DIM))
+        safe_addstr(stdscr, h - 2, 2,
+                    "⚠  Review complete?   [ y ] Submit restore job    [ n ] Cancel",
+                    curses.color_pair(C_WARN) | curses.A_BOLD)
+        draw_status_bar(stdscr,
+                        "↑/↓/PgUp/PgDn Scroll  │  y = Confirm & submit  │  n/q/Esc = Cancel",
+                        f"{offset + 1}-{min(offset + visible, len(lines))}/{len(lines)}",
+                        C_WARN)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.resizeterm(*stdscr.getmaxyx())
+        elif key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            offset = min(max_offset, offset + 1)
+        elif key == curses.KEY_PPAGE:
+            offset = max(0, offset - visible)
+        elif key == curses.KEY_NPAGE:
+            offset = min(max_offset, offset + visible)
+        elif key in (curses.KEY_HOME, ord("g")):
+            offset = 0
+        elif key in (curses.KEY_END, ord("G")):
+            offset = max_offset
+        elif key in (ord("y"), ord("Y")):
+            return True
+        elif key in (ord("n"), ord("N"), ord("q"), 27):
+            return False
+
+
 def input_text(stdscr, prompt: str, default: str = "", hint: str = "") -> str:
     """Single-line text input. Blank input returns default."""
     curses.echo()
@@ -1014,19 +1109,46 @@ def workflow_replace_instance(stdscr):
     if target["KeyName"]:
         metadata["KeyName"] = target["KeyName"]
 
-    detail = [
-        f"Recovery Point : {rp_arn[-55:]}",
-        f"Replace        : {target['InstanceId']}  ({target['Name'] or 'no name'})",
-        f"Private IP     : {target['PrivateIp']}",
-        f"Public IP      : {target['PublicIp']}",
-        f"Primary ENI    : {primary_eni or 'N/A'}",
-        f"Subnet         : {target['SubnetId']}",
-        f"Instance Type  : {target['InstanceType']}",
-        "",
-        "⚠  The existing instance will be TERMINATED.",
-        "   The original ENI will be re-attached to preserve the IP.",
+    rp_ts = rp.get("CreationDate", "")
+    rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)
+    rp_size = rp.get("BackupSizeInBytes", 0)
+    rp_size_str = (f"{rp_size // (1024**3)} GB" if rp_size >= 1024**3
+                   else f"{rp_size // (1024**2)} MB" if rp_size else "unknown")
+
+    sections = [
+        ("RECOVERY POINT", [
+            ("ARN",            rp_arn),
+            ("Vault",          vault_name_from_rp_arn(rp_arn)),
+            ("Created",        rp_ts_str),
+            ("Size",           rp_size_str),
+            ("Status",         rp.get("Status", "?")),
+            ("Encrypted",      "Yes" if rp.get("IsEncrypted") else "No"),
+        ]),
+        ("TARGET INSTANCE  ⚠ WILL BE TERMINATED", [
+            ("Instance ID",    target["InstanceId"]),
+            ("Name",           target["Name"] or "(none)"),
+            ("State",          target["State"]),
+            ("Instance Type",  target["InstanceType"]),
+            ("Private IP",     target["PrivateIp"]),
+            ("Public IP",      target["PublicIp"]),
+            ("Primary ENI",    primary_eni or "N/A"),
+            ("Subnet ID",      target["SubnetId"]),
+            ("VPC ID",         target["VpcId"]),
+            ("AZ",             target.get("AvailabilityZone", "?")),
+            ("Security Groups", ", ".join(target["SecurityGroups"])),
+            ("IAM Profile",    target["IamInstanceProfile"] or "(none)"),
+            ("Key Name",       target["KeyName"] or "(none)"),
+        ]),
+        ("RESTORE SETTINGS", [
+            ("IAM Role ARN",   iam_role),
+            ("Instance Type",  metadata["InstanceType"]),
+            ("Subnet ID",      metadata["SubnetId"]),
+            ("Security Groups", metadata["SecurityGroupIds"]),
+            ("ENI re-attach",  primary_eni or "N/A (no primary ENI found)"),
+        ]),
     ]
-    if not confirm_dialog(stdscr, "CONFIRM INSTANCE REPLACEMENT", detail):
+
+    if not show_restore_review(stdscr, "REPLACE INSTANCE", sections, metadata):
         return
 
     # Terminate
@@ -1172,18 +1294,40 @@ def workflow_new_instance_with_eni(stdscr):
     metadata["SecurityGroupIds"] = json.dumps(chosen_eni["SecurityGroups"])
     metadata["InstanceType"] = inst_type
 
-    detail = [
-        f"Recovery Point : {rp_arn[-55:]}",
-        f"Attach ENI     : {chosen_eni['NetworkInterfaceId']}",
-        f"ENI Name       : {chosen_eni['Name'] or '(none)'}",
-        f"ENI Private IP : {chosen_eni['PrivateIp']}",
-        f"Subnet         : {chosen_eni['SubnetId']}",
-        f"Instance Type  : {inst_type}",
-        "",
-        "A new EC2 instance will be restored from backup.",
-        "The selected ENI will be attached after restore completes.",
+    rp_ts = rp.get("CreationDate", "")
+    rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)
+    rp_size = rp.get("BackupSizeInBytes", 0)
+    rp_size_str = (f"{rp_size // (1024**3)} GB" if rp_size >= 1024**3
+                   else f"{rp_size // (1024**2)} MB" if rp_size else "unknown")
+
+    sections = [
+        ("RECOVERY POINT", [
+            ("ARN",            rp_arn),
+            ("Vault",          vault_name_from_rp_arn(rp_arn)),
+            ("Created",        rp_ts_str),
+            ("Size",           rp_size_str),
+            ("Status",         rp.get("Status", "?")),
+            ("Encrypted",      "Yes" if rp.get("IsEncrypted") else "No"),
+        ]),
+        ("ENI TO ATTACH", [
+            ("ENI ID",         chosen_eni["NetworkInterfaceId"]),
+            ("Name",           chosen_eni["Name"] or "(none)"),
+            ("Private IP",     chosen_eni["PrivateIp"]),
+            ("Subnet ID",      chosen_eni["SubnetId"]),
+            ("VPC ID",         chosen_eni["VpcId"]),
+            ("AZ",             chosen_eni.get("AvailabilityZone", "?")),
+            ("Security Groups", ", ".join(chosen_eni["SecurityGroups"])),
+            ("Description",    chosen_eni["Description"] or "(none)"),
+        ]),
+        ("RESTORE SETTINGS", [
+            ("IAM Role ARN",   iam_role),
+            ("Instance Type",  inst_type),
+            ("Subnet ID",      metadata["SubnetId"]),
+            ("Security Groups", metadata["SecurityGroupIds"]),
+        ]),
     ]
-    if not confirm_dialog(stdscr, "CONFIRM NEW INSTANCE RESTORE", detail):
+
+    if not show_restore_review(stdscr, "NEW INSTANCE + ENI", sections, metadata):
         return
 
     try:

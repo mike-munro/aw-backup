@@ -152,6 +152,7 @@ def list_ec2_instances() -> List[Dict]:
                     "IamInstanceProfile": inst.get("IamInstanceProfile", {}).get("Arn", ""),
                     "KeyName": inst.get("KeyName", ""),
                     "LaunchTime": inst.get("LaunchTime", ""),
+                    "Tags": inst.get("Tags", []),
                 })
     return instances
 
@@ -232,6 +233,29 @@ def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
         ResourceType="EC2",
     )
     return resp["RestoreJobId"]
+
+
+def apply_dr_tags(metadata: Dict, source_tags: List[Dict] = None) -> None:
+    """Populate metadata['Tags'] from source_tags (or existing metadata Tags),
+    prefixing the Name tag value with 'DR-' if not already present."""
+    existing = metadata.get("Tags")
+    if existing:
+        try:
+            tags = json.loads(existing)
+        except (ValueError, TypeError):
+            tags = list(source_tags) if source_tags else []
+    else:
+        tags = list(source_tags) if source_tags else []
+
+    for tag in tags:
+        if tag.get("Key") == "Name":
+            val = tag.get("Value", "")
+            if not val.startswith("DR-"):
+                tag["Value"] = f"DR-{val}"
+            break
+
+    if tags:
+        metadata["Tags"] = json.dumps(tags)
 
 
 def get_restore_job_status(job_id: str) -> Dict:
@@ -1121,6 +1145,7 @@ def workflow_replace_instance(stdscr):
         metadata["IamInstanceProfileName"] = target["IamInstanceProfile"].split("/")[-1]
     if target["KeyName"]:
         metadata["KeyName"] = target["KeyName"]
+    apply_dr_tags(metadata, target.get("Tags", []))
 
     rp_ts = rp.get("CreationDate", "")
     rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)
@@ -1158,6 +1183,7 @@ def workflow_replace_instance(stdscr):
             ("Subnet ID",      metadata["SubnetId"]),
             ("Security Groups", metadata["SecurityGroupIds"]),
             ("ENI re-attach",  primary_eni or "N/A (no primary ENI found)"),
+            ("Tags",           metadata.get("Tags", "(none)")),
         ]),
     ]
 
@@ -1319,6 +1345,7 @@ def workflow_new_instance_with_eni(stdscr):
     metadata["SubnetId"] = chosen_eni["SubnetId"]
     metadata["SecurityGroupIds"] = json.dumps(chosen_eni["SecurityGroups"])
     metadata["InstanceType"] = inst_type
+    apply_dr_tags(metadata)
 
     rp_ts = rp.get("CreationDate", "")
     rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)
@@ -1350,6 +1377,7 @@ def workflow_new_instance_with_eni(stdscr):
             ("Instance Type",  inst_type),
             ("Subnet ID",      metadata["SubnetId"]),
             ("Security Groups", metadata["SecurityGroupIds"]),
+            ("Tags",           metadata.get("Tags", "(none)")),
         ]),
     ]
 

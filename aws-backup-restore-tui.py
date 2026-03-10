@@ -53,6 +53,7 @@ class AWSClients:
         self._ec2 = None
         self._backup = None
         self._sts = None
+        self._iam = None
         self._account_id: Optional[str] = None
 
     @property
@@ -76,6 +77,12 @@ class AWSClients:
         if self._sts is None:
             self._sts = self._session.client("sts", region_name=self._region)
         return self._sts
+
+    @property
+    def iam(self):
+        if self._iam is None:
+            self._iam = self._session.client("iam")
+        return self._iam
 
     def get_account_id(self) -> str:
         if self._account_id is None:
@@ -222,7 +229,26 @@ def fetch_restore_metadata(rp_arn: str) -> Dict:
 
 
 def get_default_restore_role_arn() -> str:
-    return f"arn:aws:iam::{aws.get_account_id()}:role/awsbackupcustomservicerole"
+    try:
+        resp = aws.iam.get_role(RoleName="AWSBackupCustomServiceRole")
+        return resp["Role"]["Arn"]
+    except Exception:
+        return f"arn:aws:iam::{aws.get_account_id()}:role/AWSBackupCustomServiceRole"
+
+
+def get_source_instance_type(resource_arn: str, fallback: str = "t3.medium") -> str:
+    """Try to describe the original backed-up instance and return its InstanceType."""
+    iid = resource_arn.split("/")[-1] if "/" in resource_arn else ""
+    if not iid.startswith("i-"):
+        return fallback
+    try:
+        resp = aws.ec2.describe_instances(InstanceIds=[iid])
+        for res in resp.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                return inst.get("InstanceType", fallback)
+    except Exception:
+        pass
+    return fallback
 
 
 def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
@@ -237,7 +263,7 @@ def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
 
 def apply_dr_tags(metadata: Dict, source_tags: List[Dict] = None) -> None:
     """Populate metadata['Tags'] from source_tags (or existing metadata Tags),
-    prefixing the Name tag value with 'DR-' if not already present."""
+    prefixing the Name tag value with 'restored-' if not already present."""
     existing = metadata.get("Tags")
     if existing:
         try:
@@ -250,8 +276,8 @@ def apply_dr_tags(metadata: Dict, source_tags: List[Dict] = None) -> None:
     for tag in tags:
         if tag.get("Key") == "Name":
             val = tag.get("Value", "")
-            if not val.startswith("DR-"):
-                tag["Value"] = f"DR-{val}"
+            if not val.startswith("restored-"):
+                tag["Value"] = f"restored-{val}"
             break
 
     if tags:
@@ -1336,7 +1362,8 @@ def workflow_new_instance_with_eni(stdscr):
     if not iam_role:
         return
 
-    current_type = metadata.get("InstanceType", "t3.medium")
+    current_type = (metadata.get("InstanceType")
+                    or get_source_instance_type(rp.get("ResourceArn", "")))
     inst_type = input_text(
         stdscr, "Instance type:", current_type,
         hint=f"Backup was originally: {current_type}",

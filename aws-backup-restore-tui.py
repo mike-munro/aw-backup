@@ -53,6 +53,7 @@ class AWSClients:
         self._ec2 = None
         self._backup = None
         self._sts = None
+        self._iam = None
         self._account_id: Optional[str] = None
 
     @property
@@ -76,6 +77,12 @@ class AWSClients:
         if self._sts is None:
             self._sts = self._session.client("sts", region_name=self._region)
         return self._sts
+
+    @property
+    def iam(self):
+        if self._iam is None:
+            self._iam = self._session.client("iam")
+        return self._iam
 
     def get_account_id(self) -> str:
         if self._account_id is None:
@@ -152,8 +159,32 @@ def list_ec2_instances() -> List[Dict]:
                     "IamInstanceProfile": inst.get("IamInstanceProfile", {}).get("Arn", ""),
                     "KeyName": inst.get("KeyName", ""),
                     "LaunchTime": inst.get("LaunchTime", ""),
+                    "Tags": inst.get("Tags", []),
                 })
     return instances
+
+
+def get_instance_names(instance_ids: List[str]) -> Dict[str, str]:
+    """Return {instance_id: Name-tag-value} for a list of IDs.
+    Missing/terminated instances are silently skipped."""
+    if not instance_ids:
+        return {}
+    names: Dict[str, str] = {}
+    # describe_instances accepts up to 200 IDs per call
+    for chunk_start in range(0, len(instance_ids), 200):
+        chunk = instance_ids[chunk_start: chunk_start + 200]
+        try:
+            resp = aws.ec2.describe_instances(InstanceIds=chunk)
+            for res in resp["Reservations"]:
+                for inst in res["Instances"]:
+                    iid = inst["InstanceId"]
+                    name = next(
+                        (t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), ""
+                    )
+                    names[iid] = name
+        except ClientError:
+            pass  # instance may be terminated – that's fine
+    return names
 
 
 def list_enis() -> List[Dict]:
@@ -198,7 +229,26 @@ def fetch_restore_metadata(rp_arn: str) -> Dict:
 
 
 def get_default_restore_role_arn() -> str:
-    return f"arn:aws:iam::{aws.get_account_id()}:role/service-role/AWSBackupDefaultServiceRole"
+    try:
+        resp = aws.iam.get_role(RoleName="AWSBackupCustomServiceRole")
+        return resp["Role"]["Arn"]
+    except Exception:
+        return f"arn:aws:iam::{aws.get_account_id()}:role/AWSBackupCustomServiceRole"
+
+
+def get_source_instance_type(resource_arn: str, fallback: str = "t3.medium") -> str:
+    """Try to describe the original backed-up instance and return its InstanceType."""
+    iid = resource_arn.split("/")[-1] if "/" in resource_arn else ""
+    if not iid.startswith("i-"):
+        return fallback
+    try:
+        resp = aws.ec2.describe_instances(InstanceIds=[iid])
+        for res in resp.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                return inst.get("InstanceType", fallback)
+    except Exception:
+        pass
+    return fallback
 
 
 def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
@@ -209,6 +259,29 @@ def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
         ResourceType="EC2",
     )
     return resp["RestoreJobId"]
+
+
+def apply_dr_tags(metadata: Dict, source_tags: List[Dict] = None) -> None:
+    """Populate metadata['Tags'] from source_tags (or existing metadata Tags),
+    prefixing the Name tag value with 'restored-' if not already present."""
+    existing = metadata.get("Tags")
+    if existing:
+        try:
+            tags = json.loads(existing)
+        except (ValueError, TypeError):
+            tags = list(source_tags) if source_tags else []
+    else:
+        tags = list(source_tags) if source_tags else []
+
+    for tag in tags:
+        if tag.get("Key") == "Name":
+            val = tag.get("Value", "")
+            if not val.startswith("restored-"):
+                tag["Value"] = f"restored-{val}"
+            break
+
+    if tags:
+        metadata["Tags"] = json.dumps(tags)
 
 
 def get_restore_job_status(job_id: str) -> Dict:
@@ -620,6 +693,101 @@ def confirm_dialog(stdscr, title: str, detail_lines: list) -> bool:
             return False
 
 
+def show_restore_review(stdscr, title: str, sections: list, metadata: Dict) -> bool:
+    """Full-screen scrollable restore plan review.
+
+    sections: list of (section_title, [(label, value), ...])
+    metadata: the raw dict that will be sent to start_restore_job
+
+    Returns True if user confirms with y, False otherwise.
+    Scrollable with ↑/↓/PgUp/PgDn. y to confirm, n/q/Esc to cancel.
+    """
+    # Build flat line list from sections + metadata
+    lines: List[tuple] = []  # (text, attr_constant)
+
+    for sec_title, fields in sections:
+        lines.append((f"  {sec_title}", "header"))
+        lines.append(("  " + "─" * max(len(sec_title) + 2, 50), "dim"))
+        for label, value in fields:
+            lines.append((f"    {label:<26}  {value}", "field"))
+        lines.append(("", "dim"))
+
+    # Full metadata section
+    lines.append(("  FULL RESTORE METADATA  (sent to AWS Backup)", "header"))
+    lines.append(("  " + "─" * 52, "dim"))
+    for k, v in sorted(metadata.items()):
+        lines.append((f"    {k:<30}  {v}", "field"))
+    lines.append(("", "dim"))
+
+    offset = 0
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        draw_title_bar(stdscr, f"Restore Review  ─  {title}", aws.region)
+
+        content_top = 2
+        content_bot = h - 4  # leave room for confirm bar
+        visible = max(1, content_bot - content_top)
+
+        # Clamp offset
+        max_offset = max(0, len(lines) - visible)
+        offset = max(0, min(offset, max_offset))
+
+        for i in range(visible):
+            li = offset + i
+            if li >= len(lines):
+                break
+            text, kind = lines[li]
+            if kind == "header":
+                attr = curses.color_pair(C_HEADER) | curses.A_BOLD
+            elif kind == "dim":
+                attr = curses.color_pair(C_DIM)
+            else:
+                attr = curses.color_pair(C_MENU)
+            safe_addstr(stdscr, content_top + i, 0, str(text)[: w - 1], attr)
+
+        # Scroll indicator
+        if len(lines) > visible:
+            pct = offset / max(max_offset, 1)
+            sb_h = max(1, visible * visible // max(len(lines), 1))
+            sb_top = int(pct * (visible - sb_h))
+            for sb in range(visible):
+                ch = "█" if sb_top <= sb < sb_top + sb_h else "░"
+                safe_addstr(stdscr, content_top + sb, w - 1, ch, curses.color_pair(C_DIM))
+
+        # Confirm bar at bottom
+        safe_addstr(stdscr, h - 3, 2, "─" * (w - 4), curses.color_pair(C_DIM))
+        safe_addstr(stdscr, h - 2, 2,
+                    "⚠  Review complete?   [ y ] Submit restore job    [ n ] Cancel",
+                    curses.color_pair(C_WARN) | curses.A_BOLD)
+        draw_status_bar(stdscr,
+                        "↑/↓/PgUp/PgDn Scroll  │  y = Confirm & submit  │  n/q/Esc = Cancel",
+                        f"{offset + 1}-{min(offset + visible, len(lines))}/{len(lines)}",
+                        C_WARN)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.resizeterm(*stdscr.getmaxyx())
+        elif key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            offset = min(max_offset, offset + 1)
+        elif key == curses.KEY_PPAGE:
+            offset = max(0, offset - visible)
+        elif key == curses.KEY_NPAGE:
+            offset = min(max_offset, offset + visible)
+        elif key in (curses.KEY_HOME, ord("g")):
+            offset = 0
+        elif key in (curses.KEY_END, ord("G")):
+            offset = max_offset
+        elif key in (ord("y"), ord("Y")):
+            return True
+        elif key in (ord("n"), ord("N"), ord("q"), 27):
+            return False
+
+
 def input_text(stdscr, prompt: str, default: str = "", hint: str = "") -> str:
     """Single-line text input. Blank input returns default."""
     curses.echo()
@@ -747,8 +915,6 @@ def poll_restore_job(stdscr, job_id: str) -> Optional[Dict]:
 def _fmt_rp(rp: Dict) -> str:
     ts = rp.get("CreationDate", "")
     ts_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts)
-    arn = rp.get("ResourceArn", "")
-    iid = arn.split("/")[-1] if "/" in arn else arn[-20:]
     size = rp.get("BackupSizeInBytes", 0)
     if size >= 1024 ** 3:
         size_str = f"{size // (1024**3)}GB"
@@ -756,7 +922,7 @@ def _fmt_rp(rp: Dict) -> str:
         size_str = f"{size // (1024**2)}MB"
     else:
         size_str = "?"
-    return f"{ts_str}  │  {iid:<22}  │  {size_str:>8}  │  {rp.get('Status', '?')}"
+    return f"{ts_str}  │  {size_str:>8}  │  {rp.get('Status', '?')}"
 
 
 def _detail_rp(rp: Dict) -> List[str]:
@@ -767,8 +933,6 @@ def _detail_rp(rp: Dict) -> List[str]:
     size = rp.get("BackupSizeInBytes", 0)
     size_str = (f"{size // (1024**3)} GB" if size >= 1024 ** 3
                 else f"{size // (1024**2)} MB" if size else "N/A")
-    arn = rp.get("ResourceArn", "")
-    iid = arn.split("/")[-1] if "/" in arn else ""
     return [
         f"Created : {ts_str}",
         f"Expires : {exp_str}",
@@ -776,14 +940,35 @@ def _detail_rp(rp: Dict) -> List[str]:
         f"Status  : {rp.get('Status', '?')}",
         f"Type    : {rp.get('ResourceType', '?')}",
         f"Enc     : {'Yes' if rp.get('IsEncrypted') else 'No'}",
-        "",
-        f"Instance:",
-        f"  {iid}",
     ]
 
 
+def _group_rps_by_instance(rps: List[Dict], names: Dict[str, str]) -> List[Dict]:
+    """Collapse a flat list of recovery points into one entry per instance ID."""
+    groups: Dict[str, Dict] = {}
+    for rp in rps:
+        arn = rp.get("ResourceArn", "")
+        iid = arn.split("/")[-1] if "/" in arn else arn
+        if iid not in groups:
+            groups[iid] = {
+                "instance_id": iid,
+                "name": names.get(iid, ""),
+                "count": 0,
+                "latest": None,
+                "rps": [],
+            }
+        g = groups[iid]
+        g["count"] += 1
+        g["rps"].append(rp)
+        ts = rp.get("CreationDate")
+        if ts and (g["latest"] is None or ts > g["latest"]):
+            g["latest"] = ts
+    # Sort by latest backup descending
+    return sorted(groups.values(), key=lambda g: g["latest"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+
 def select_vault_and_recovery_point(stdscr) -> Optional[Dict]:
-    """Walk user through vault → recovery point selection."""
+    """Walk user through vault → instance → recovery point selection."""
     try:
         vaults = run_with_spinner(stdscr, "Loading backup vaults…", list_backup_vaults)
     except Exception as e:
@@ -819,13 +1004,22 @@ def select_vault_and_recovery_point(stdscr) -> Optional[Dict]:
 
     vault = vaults[idx]
 
+    # Load all recovery points then fetch instance names in parallel
     try:
-        rps = run_with_spinner(
-            stdscr, f"Loading recovery points from '{vault['name']}'…",
-            list_recovery_points, vault["name"],
+        def _load_rps_and_names():
+            rps = list_recovery_points(vault["name"])
+            iids = list({rp["ResourceArn"].split("/")[-1]
+                         for rp in rps if "/" in rp.get("ResourceArn", "")})
+            names = get_instance_names(iids)
+            return rps, names
+
+        rps, inst_names = run_with_spinner(
+            stdscr,
+            f"Loading recovery points from '{vault['name']}'…",
+            _load_rps_and_names,
         )
     except Exception as e:
-        show_message(stdscr, "Error", [f"Failed to list recovery points: {e}"], C_ERROR)
+        show_message(stdscr, "Error", [f"Failed to load recovery points: {e}"], C_ERROR)
         return None
 
     if not rps:
@@ -834,17 +1028,53 @@ def select_vault_and_recovery_point(stdscr) -> Optional[Dict]:
         ], C_ERROR)
         return None
 
+    # ── Step 2: select instance ──────────────────────────────────────
+    groups = _group_rps_by_instance(rps, inst_names)
+
+    def fmt_group(g: Dict) -> str:
+        ts = g["latest"]
+        ts_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else "?"
+        name_part = f"  {g['name']}" if g["name"] else ""
+        return f"{g['instance_id']}{name_part:<28}  │  {g['count']:>3} points  │  latest {ts_str}"
+
+    def detail_group(g: Dict) -> List[str]:
+        ts = g["latest"]
+        ts_str = ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(ts, "strftime") else "?"
+        return [
+            f"Instance : {g['instance_id']}",
+            f"Name     : {g['name'] or '(none / terminated)'}",
+            f"Points   : {g['count']}",
+            f"Latest   : {ts_str}",
+        ]
+
+    g_idx = menu_select(
+        stdscr,
+        f"Select Instance  ─  {vault['name']}",
+        groups,
+        format_fn=fmt_group,
+        detail_fn=detail_group,
+        breadcrumb=f"Home  ›  {vault['name']}  ›  Select Instance",
+    )
+    if g_idx < 0:
+        return None
+
+    chosen_group = groups[g_idx]
+
+    # ── Step 3: select recovery point for that instance ──────────────
+    instance_rps = chosen_group["rps"]  # already sorted newest-first
+
+    label = chosen_group["name"] or chosen_group["instance_id"]
     idx = menu_select(
         stdscr,
-        f"Recovery Points  ─  {vault['name']}  (newest first)",
-        rps,
+        f"Recovery Points  ─  {label}  (newest first)",
+        instance_rps,
         format_fn=_fmt_rp,
         detail_fn=_detail_rp,
-        breadcrumb=f"Home  ›  {vault['name']}  ›  Recovery Point",
+        breadcrumb=f"Home  ›  {vault['name']}  ›  {chosen_group['instance_id']}  ›  Recovery Point",
     )
     if idx < 0:
         return None
-    return rps[idx]
+    return instance_rps[idx]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -910,6 +1140,19 @@ def workflow_replace_instance(stdscr):
     try:
         metadata = run_with_spinner(
             stdscr, "Fetching restore metadata…", fetch_restore_metadata, rp_arn)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedException"):
+            show_message(stdscr, "Metadata Unavailable", [
+                "GetRecoveryPointRestoreMetadata was denied.",
+                "Proceeding with metadata built from current instance config.",
+                "",
+                f"({code})",
+            ], C_WARN)
+            metadata = {}
+        else:
+            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+            return
     except Exception as e:
         show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
         return
@@ -928,20 +1171,49 @@ def workflow_replace_instance(stdscr):
         metadata["IamInstanceProfileName"] = target["IamInstanceProfile"].split("/")[-1]
     if target["KeyName"]:
         metadata["KeyName"] = target["KeyName"]
+    apply_dr_tags(metadata, target.get("Tags", []))
 
-    detail = [
-        f"Recovery Point : {rp_arn[-55:]}",
-        f"Replace        : {target['InstanceId']}  ({target['Name'] or 'no name'})",
-        f"Private IP     : {target['PrivateIp']}",
-        f"Public IP      : {target['PublicIp']}",
-        f"Primary ENI    : {primary_eni or 'N/A'}",
-        f"Subnet         : {target['SubnetId']}",
-        f"Instance Type  : {target['InstanceType']}",
-        "",
-        "⚠  The existing instance will be TERMINATED.",
-        "   The original ENI will be re-attached to preserve the IP.",
+    rp_ts = rp.get("CreationDate", "")
+    rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)
+    rp_size = rp.get("BackupSizeInBytes", 0)
+    rp_size_str = (f"{rp_size // (1024**3)} GB" if rp_size >= 1024**3
+                   else f"{rp_size // (1024**2)} MB" if rp_size else "unknown")
+
+    sections = [
+        ("RECOVERY POINT", [
+            ("ARN",            rp_arn),
+            ("Vault",          vault_name_from_rp_arn(rp_arn)),
+            ("Created",        rp_ts_str),
+            ("Size",           rp_size_str),
+            ("Status",         rp.get("Status", "?")),
+            ("Encrypted",      "Yes" if rp.get("IsEncrypted") else "No"),
+        ]),
+        ("TARGET INSTANCE  ⚠ WILL BE TERMINATED", [
+            ("Instance ID",    target["InstanceId"]),
+            ("Name",           target["Name"] or "(none)"),
+            ("State",          target["State"]),
+            ("Instance Type",  target["InstanceType"]),
+            ("Private IP",     target["PrivateIp"]),
+            ("Public IP",      target["PublicIp"]),
+            ("Primary ENI",    primary_eni or "N/A"),
+            ("Subnet ID",      target["SubnetId"]),
+            ("VPC ID",         target["VpcId"]),
+            ("AZ",             target.get("AvailabilityZone", "?")),
+            ("Security Groups", ", ".join(target["SecurityGroups"])),
+            ("IAM Profile",    target["IamInstanceProfile"] or "(none)"),
+            ("Key Name",       target["KeyName"] or "(none)"),
+        ]),
+        ("RESTORE SETTINGS", [
+            ("IAM Role ARN",   iam_role),
+            ("Instance Type",  metadata["InstanceType"]),
+            ("Subnet ID",      metadata["SubnetId"]),
+            ("Security Groups", metadata["SecurityGroupIds"]),
+            ("ENI re-attach",  primary_eni or "N/A (no primary ENI found)"),
+            ("Tags",           metadata.get("Tags", "(none)")),
+        ]),
     ]
-    if not confirm_dialog(stdscr, "CONFIRM INSTANCE REPLACEMENT", detail):
+
+    if not show_restore_review(stdscr, "REPLACE INSTANCE", sections, metadata):
         return
 
     # Terminate
@@ -1066,6 +1338,19 @@ def workflow_new_instance_with_eni(stdscr):
     try:
         metadata = run_with_spinner(
             stdscr, "Fetching restore metadata…", fetch_restore_metadata, rp_arn)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedException"):
+            show_message(stdscr, "Metadata Unavailable", [
+                "GetRecoveryPointRestoreMetadata was denied.",
+                "Proceeding with metadata built from ENI/instance type config.",
+                "",
+                f"({code})",
+            ], C_WARN)
+            metadata = {}
+        else:
+            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+            return
     except Exception as e:
         show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
         return
@@ -1077,28 +1362,59 @@ def workflow_new_instance_with_eni(stdscr):
     if not iam_role:
         return
 
-    current_type = metadata.get("InstanceType", "t3.medium")
+    current_type = (metadata.get("InstanceType")
+                    or get_source_instance_type(rp.get("ResourceArn", "")))
     inst_type = input_text(
         stdscr, "Instance type:", current_type,
         hint=f"Backup was originally: {current_type}",
     )
 
-    metadata["SubnetId"] = chosen_eni["SubnetId"]
-    metadata["SecurityGroupIds"] = json.dumps(chosen_eni["SecurityGroups"])
+    # Use the chosen ENI as device index 0 so the restore creates NO new ENI.
+    # Specifying NetworkInterfaces is mutually exclusive with SubnetId /
+    # SecurityGroupIds at the top level in RunInstances, so remove those keys.
+    metadata.pop("SubnetId", None)
+    metadata.pop("SecurityGroupIds", None)
+    metadata["NetworkInterfaces"] = json.dumps([{
+        "DeviceIndex": 0,
+        "NetworkInterfaceId": chosen_eni["NetworkInterfaceId"],
+    }])
     metadata["InstanceType"] = inst_type
+    apply_dr_tags(metadata)
 
-    detail = [
-        f"Recovery Point : {rp_arn[-55:]}",
-        f"Attach ENI     : {chosen_eni['NetworkInterfaceId']}",
-        f"ENI Name       : {chosen_eni['Name'] or '(none)'}",
-        f"ENI Private IP : {chosen_eni['PrivateIp']}",
-        f"Subnet         : {chosen_eni['SubnetId']}",
-        f"Instance Type  : {inst_type}",
-        "",
-        "A new EC2 instance will be restored from backup.",
-        "The selected ENI will be attached after restore completes.",
+    rp_ts = rp.get("CreationDate", "")
+    rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)
+    rp_size = rp.get("BackupSizeInBytes", 0)
+    rp_size_str = (f"{rp_size // (1024**3)} GB" if rp_size >= 1024**3
+                   else f"{rp_size // (1024**2)} MB" if rp_size else "unknown")
+
+    sections = [
+        ("RECOVERY POINT", [
+            ("ARN",            rp_arn),
+            ("Vault",          vault_name_from_rp_arn(rp_arn)),
+            ("Created",        rp_ts_str),
+            ("Size",           rp_size_str),
+            ("Status",         rp.get("Status", "?")),
+            ("Encrypted",      "Yes" if rp.get("IsEncrypted") else "No"),
+        ]),
+        ("ENI TO ATTACH", [
+            ("ENI ID",         chosen_eni["NetworkInterfaceId"]),
+            ("Name",           chosen_eni["Name"] or "(none)"),
+            ("Private IP",     chosen_eni["PrivateIp"]),
+            ("Subnet ID",      chosen_eni["SubnetId"]),
+            ("VPC ID",         chosen_eni["VpcId"]),
+            ("AZ",             chosen_eni.get("AvailabilityZone", "?")),
+            ("Security Groups", ", ".join(chosen_eni["SecurityGroups"])),
+            ("Description",    chosen_eni["Description"] or "(none)"),
+        ]),
+        ("RESTORE SETTINGS", [
+            ("IAM Role ARN",   iam_role),
+            ("Instance Type",  inst_type),
+            ("Primary ENI",    chosen_eni["NetworkInterfaceId"]),
+            ("Tags",           metadata.get("Tags", "(none)")),
+        ]),
     ]
-    if not confirm_dialog(stdscr, "CONFIRM NEW INSTANCE RESTORE", detail):
+
+    if not show_restore_review(stdscr, "NEW INSTANCE + ENI", sections, metadata):
         return
 
     try:
@@ -1123,25 +1439,13 @@ def workflow_new_instance_with_eni(stdscr):
         created_arn = result.get("CreatedResourceArn", "")
         new_iid = created_arn.split("/")[-1] if "/" in created_arn else ""
         if new_iid:
-            try:
-                run_with_spinner(
-                    stdscr, f"Attaching ENI {chosen_eni['NetworkInterfaceId']}…",
-                    attach_eni, chosen_eni["NetworkInterfaceId"], new_iid, 1,
-                )
-                show_message(stdscr, "Restore Complete!", [
-                    f"New instance : {new_iid}",
-                    f"Attached ENI : {chosen_eni['NetworkInterfaceId']}",
-                    f"ENI IP       : {chosen_eni['PrivateIp']}",
-                    "",
-                    "ENI attached as secondary interface (device index 1).",
-                    "Configure OS networking if needed.",
-                ], C_SUCCESS)
-            except Exception as e:
-                show_message(stdscr, "ENI Attach Failed", [
-                    f"Instance restored : {new_iid}",
-                    f"Attach failed     : {e}",
-                    f"Manually attach   : {chosen_eni['NetworkInterfaceId']}",
-                ], C_ERROR)
+            show_message(stdscr, "Restore Complete!", [
+                f"New instance : {new_iid}",
+                f"Primary ENI  : {chosen_eni['NetworkInterfaceId']}",
+                f"ENI IP       : {chosen_eni['PrivateIp']}",
+                "",
+                "ENI was used as the primary interface (device index 0).",
+            ], C_SUCCESS)
         else:
             show_message(stdscr, "Restore Complete", [
                 "Job completed but could not extract instance ID.",

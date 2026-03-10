@@ -1369,8 +1369,15 @@ def workflow_new_instance_with_eni(stdscr):
         hint=f"Backup was originally: {current_type}",
     )
 
-    metadata["SubnetId"] = chosen_eni["SubnetId"]
-    metadata["SecurityGroupIds"] = json.dumps(chosen_eni["SecurityGroups"])
+    # Use the chosen ENI as device index 0 so the restore creates NO new ENI.
+    # Specifying NetworkInterfaces is mutually exclusive with SubnetId /
+    # SecurityGroupIds at the top level in RunInstances, so remove those keys.
+    metadata.pop("SubnetId", None)
+    metadata.pop("SecurityGroupIds", None)
+    metadata["NetworkInterfaces"] = json.dumps([{
+        "DeviceIndex": 0,
+        "NetworkInterfaceId": chosen_eni["NetworkInterfaceId"],
+    }])
     metadata["InstanceType"] = inst_type
     apply_dr_tags(metadata)
 
@@ -1402,8 +1409,7 @@ def workflow_new_instance_with_eni(stdscr):
         ("RESTORE SETTINGS", [
             ("IAM Role ARN",   iam_role),
             ("Instance Type",  inst_type),
-            ("Subnet ID",      metadata["SubnetId"]),
-            ("Security Groups", metadata["SecurityGroupIds"]),
+            ("Primary ENI",    chosen_eni["NetworkInterfaceId"]),
             ("Tags",           metadata.get("Tags", "(none)")),
         ]),
     ]
@@ -1433,25 +1439,13 @@ def workflow_new_instance_with_eni(stdscr):
         created_arn = result.get("CreatedResourceArn", "")
         new_iid = created_arn.split("/")[-1] if "/" in created_arn else ""
         if new_iid:
-            try:
-                run_with_spinner(
-                    stdscr, f"Attaching ENI {chosen_eni['NetworkInterfaceId']}…",
-                    attach_eni, chosen_eni["NetworkInterfaceId"], new_iid, 1,
-                )
-                show_message(stdscr, "Restore Complete!", [
-                    f"New instance : {new_iid}",
-                    f"Attached ENI : {chosen_eni['NetworkInterfaceId']}",
-                    f"ENI IP       : {chosen_eni['PrivateIp']}",
-                    "",
-                    "ENI attached as secondary interface (device index 1).",
-                    "Configure OS networking if needed.",
-                ], C_SUCCESS)
-            except Exception as e:
-                show_message(stdscr, "ENI Attach Failed", [
-                    f"Instance restored : {new_iid}",
-                    f"Attach failed     : {e}",
-                    f"Manually attach   : {chosen_eni['NetworkInterfaceId']}",
-                ], C_ERROR)
+            show_message(stdscr, "Restore Complete!", [
+                f"New instance : {new_iid}",
+                f"Primary ENI  : {chosen_eni['NetworkInterfaceId']}",
+                f"ENI IP       : {chosen_eni['PrivateIp']}",
+                "",
+                "ENI was used as the primary interface (device index 0).",
+            ], C_SUCCESS)
         else:
             show_message(stdscr, "Restore Complete", [
                 "Job completed but could not extract instance ID.",

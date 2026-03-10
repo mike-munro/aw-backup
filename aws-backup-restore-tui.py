@@ -156,6 +156,29 @@ def list_ec2_instances() -> List[Dict]:
     return instances
 
 
+def get_instance_names(instance_ids: List[str]) -> Dict[str, str]:
+    """Return {instance_id: Name-tag-value} for a list of IDs.
+    Missing/terminated instances are silently skipped."""
+    if not instance_ids:
+        return {}
+    names: Dict[str, str] = {}
+    # describe_instances accepts up to 200 IDs per call
+    for chunk_start in range(0, len(instance_ids), 200):
+        chunk = instance_ids[chunk_start: chunk_start + 200]
+        try:
+            resp = aws.ec2.describe_instances(InstanceIds=chunk)
+            for res in resp["Reservations"]:
+                for inst in res["Instances"]:
+                    iid = inst["InstanceId"]
+                    name = next(
+                        (t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), ""
+                    )
+                    names[iid] = name
+        except ClientError:
+            pass  # instance may be terminated – that's fine
+    return names
+
+
 def list_enis() -> List[Dict]:
     """Return available (not in-use) ENIs."""
     enis = []
@@ -747,8 +770,6 @@ def poll_restore_job(stdscr, job_id: str) -> Optional[Dict]:
 def _fmt_rp(rp: Dict) -> str:
     ts = rp.get("CreationDate", "")
     ts_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts)
-    arn = rp.get("ResourceArn", "")
-    iid = arn.split("/")[-1] if "/" in arn else arn[-20:]
     size = rp.get("BackupSizeInBytes", 0)
     if size >= 1024 ** 3:
         size_str = f"{size // (1024**3)}GB"
@@ -756,7 +777,7 @@ def _fmt_rp(rp: Dict) -> str:
         size_str = f"{size // (1024**2)}MB"
     else:
         size_str = "?"
-    return f"{ts_str}  │  {iid:<22}  │  {size_str:>8}  │  {rp.get('Status', '?')}"
+    return f"{ts_str}  │  {size_str:>8}  │  {rp.get('Status', '?')}"
 
 
 def _detail_rp(rp: Dict) -> List[str]:
@@ -767,8 +788,6 @@ def _detail_rp(rp: Dict) -> List[str]:
     size = rp.get("BackupSizeInBytes", 0)
     size_str = (f"{size // (1024**3)} GB" if size >= 1024 ** 3
                 else f"{size // (1024**2)} MB" if size else "N/A")
-    arn = rp.get("ResourceArn", "")
-    iid = arn.split("/")[-1] if "/" in arn else ""
     return [
         f"Created : {ts_str}",
         f"Expires : {exp_str}",
@@ -776,14 +795,35 @@ def _detail_rp(rp: Dict) -> List[str]:
         f"Status  : {rp.get('Status', '?')}",
         f"Type    : {rp.get('ResourceType', '?')}",
         f"Enc     : {'Yes' if rp.get('IsEncrypted') else 'No'}",
-        "",
-        f"Instance:",
-        f"  {iid}",
     ]
 
 
+def _group_rps_by_instance(rps: List[Dict], names: Dict[str, str]) -> List[Dict]:
+    """Collapse a flat list of recovery points into one entry per instance ID."""
+    groups: Dict[str, Dict] = {}
+    for rp in rps:
+        arn = rp.get("ResourceArn", "")
+        iid = arn.split("/")[-1] if "/" in arn else arn
+        if iid not in groups:
+            groups[iid] = {
+                "instance_id": iid,
+                "name": names.get(iid, ""),
+                "count": 0,
+                "latest": None,
+                "rps": [],
+            }
+        g = groups[iid]
+        g["count"] += 1
+        g["rps"].append(rp)
+        ts = rp.get("CreationDate")
+        if ts and (g["latest"] is None or ts > g["latest"]):
+            g["latest"] = ts
+    # Sort by latest backup descending
+    return sorted(groups.values(), key=lambda g: g["latest"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+
 def select_vault_and_recovery_point(stdscr) -> Optional[Dict]:
-    """Walk user through vault → recovery point selection."""
+    """Walk user through vault → instance → recovery point selection."""
     try:
         vaults = run_with_spinner(stdscr, "Loading backup vaults…", list_backup_vaults)
     except Exception as e:
@@ -819,13 +859,22 @@ def select_vault_and_recovery_point(stdscr) -> Optional[Dict]:
 
     vault = vaults[idx]
 
+    # Load all recovery points then fetch instance names in parallel
     try:
-        rps = run_with_spinner(
-            stdscr, f"Loading recovery points from '{vault['name']}'…",
-            list_recovery_points, vault["name"],
+        def _load_rps_and_names():
+            rps = list_recovery_points(vault["name"])
+            iids = list({rp["ResourceArn"].split("/")[-1]
+                         for rp in rps if "/" in rp.get("ResourceArn", "")})
+            names = get_instance_names(iids)
+            return rps, names
+
+        rps, inst_names = run_with_spinner(
+            stdscr,
+            f"Loading recovery points from '{vault['name']}'…",
+            _load_rps_and_names,
         )
     except Exception as e:
-        show_message(stdscr, "Error", [f"Failed to list recovery points: {e}"], C_ERROR)
+        show_message(stdscr, "Error", [f"Failed to load recovery points: {e}"], C_ERROR)
         return None
 
     if not rps:
@@ -834,17 +883,53 @@ def select_vault_and_recovery_point(stdscr) -> Optional[Dict]:
         ], C_ERROR)
         return None
 
+    # ── Step 2: select instance ──────────────────────────────────────
+    groups = _group_rps_by_instance(rps, inst_names)
+
+    def fmt_group(g: Dict) -> str:
+        ts = g["latest"]
+        ts_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else "?"
+        name_part = f"  {g['name']}" if g["name"] else ""
+        return f"{g['instance_id']}{name_part:<28}  │  {g['count']:>3} points  │  latest {ts_str}"
+
+    def detail_group(g: Dict) -> List[str]:
+        ts = g["latest"]
+        ts_str = ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(ts, "strftime") else "?"
+        return [
+            f"Instance : {g['instance_id']}",
+            f"Name     : {g['name'] or '(none / terminated)'}",
+            f"Points   : {g['count']}",
+            f"Latest   : {ts_str}",
+        ]
+
+    g_idx = menu_select(
+        stdscr,
+        f"Select Instance  ─  {vault['name']}",
+        groups,
+        format_fn=fmt_group,
+        detail_fn=detail_group,
+        breadcrumb=f"Home  ›  {vault['name']}  ›  Select Instance",
+    )
+    if g_idx < 0:
+        return None
+
+    chosen_group = groups[g_idx]
+
+    # ── Step 3: select recovery point for that instance ──────────────
+    instance_rps = chosen_group["rps"]  # already sorted newest-first
+
+    label = chosen_group["name"] or chosen_group["instance_id"]
     idx = menu_select(
         stdscr,
-        f"Recovery Points  ─  {vault['name']}  (newest first)",
-        rps,
+        f"Recovery Points  ─  {label}  (newest first)",
+        instance_rps,
         format_fn=_fmt_rp,
         detail_fn=_detail_rp,
-        breadcrumb=f"Home  ›  {vault['name']}  ›  Recovery Point",
+        breadcrumb=f"Home  ›  {vault['name']}  ›  {chosen_group['instance_id']}  ›  Recovery Point",
     )
     if idx < 0:
         return None
-    return rps[idx]
+    return instance_rps[idx]
 
 
 # ──────────────────────────────────────────────────────────────────────

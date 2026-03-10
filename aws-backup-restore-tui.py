@@ -221,7 +221,7 @@ def fetch_restore_metadata(rp_arn: str) -> Dict:
 
 
 def get_default_restore_role_arn() -> str:
-    return f"arn:aws:iam::{aws.get_account_id()}:role/service-role/AWSBackupDefaultServiceRole"
+    return f"arn:aws:iam::{aws.get_account_id()}:role/awsbackupcustomservicerole"
 
 
 def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:

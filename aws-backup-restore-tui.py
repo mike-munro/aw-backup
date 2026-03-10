@@ -1090,6 +1090,19 @@ def workflow_replace_instance(stdscr):
     try:
         metadata = run_with_spinner(
             stdscr, "Fetching restore metadata…", fetch_restore_metadata, rp_arn)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedException"):
+            show_message(stdscr, "Metadata Unavailable", [
+                "GetRecoveryPointRestoreMetadata was denied.",
+                "Proceeding with metadata built from current instance config.",
+                "",
+                f"({code})",
+            ], C_WARN)
+            metadata = {}
+        else:
+            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+            return
     except Exception as e:
         show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
         return
@@ -1273,6 +1286,19 @@ def workflow_new_instance_with_eni(stdscr):
     try:
         metadata = run_with_spinner(
             stdscr, "Fetching restore metadata…", fetch_restore_metadata, rp_arn)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedException"):
+            show_message(stdscr, "Metadata Unavailable", [
+                "GetRecoveryPointRestoreMetadata was denied.",
+                "Proceeding with metadata built from ENI/instance type config.",
+                "",
+                f"({code})",
+            ], C_WARN)
+            metadata = {}
+        else:
+            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+            return
     except Exception as e:
         show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
         return

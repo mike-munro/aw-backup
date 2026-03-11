@@ -979,9 +979,11 @@ def _group_rps_by_instance(rps: List[Dict], names: Dict[str, str]) -> List[Dict]
         arn = rp.get("ResourceArn", "")
         iid = arn.split("/")[-1] if "/" in arn else arn
         if iid not in groups:
+            # Prefer live EC2 Name tag; fall back to ResourceName stored in the recovery point
+            name = names.get(iid) or rp.get("ResourceName", "")
             groups[iid] = {
                 "instance_id": iid,
-                "name": names.get(iid, ""),
+                "name": name,
                 "count": 0,
                 "latest": None,
                 "rps": [],

@@ -89,6 +89,19 @@ class AWSClients:
             self._account_id = self.sts.get_caller_identity()["Account"]
         return self._account_id
 
+    def backup_with_role(self, role_arn: str):
+        """Return a backup client using temporary credentials from an assumed role."""
+        creds = self.sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="aw-backup-restore-metadata",
+        )["Credentials"]
+        session = boto3.session.Session(
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+        )
+        return session.client("backup", region_name=self._region)
+
 
 aws = AWSClients()
 
@@ -219,9 +232,10 @@ def vault_name_from_rp_arn(rp_arn: str) -> str:
     return rp_arn.split(":")[-1].split("/")[0]
 
 
-def fetch_restore_metadata(rp_arn: str) -> Dict:
-    """Retrieve restore metadata for a recovery point."""
-    resp = aws.backup.get_recovery_point_restore_metadata(
+def fetch_restore_metadata(rp_arn: str, role_arn: str = "") -> Dict:
+    """Retrieve restore metadata for a recovery point, optionally via an assumed role."""
+    client = aws.backup_with_role(role_arn) if role_arn else aws.backup
+    resp = client.get_recovery_point_restore_metadata(
         BackupVaultName=vault_name_from_rp_arn(rp_arn),
         RecoveryPointArn=rp_arn,
     )
@@ -825,6 +839,43 @@ def show_restore_review(stdscr, title: str, sections: list, metadata: Dict) -> b
             return False
 
 
+def fetch_metadata_interactive(stdscr, rp_arn: str, denied_hint: str = "") -> Optional[Dict]:
+    """Fetch restore metadata, prompting to assume a role if access is denied.
+
+    Returns the metadata dict, or None to signal the caller should abort.
+    Returns {} if the user explicitly skips role assumption after a denial.
+    """
+    _ACCESS_DENIED = ("AccessDenied", "AccessDeniedException", "UnauthorizedException")
+    role_arn = ""
+    while True:
+        try:
+            return run_with_spinner(
+                stdscr, "Fetching restore metadata…",
+                fetch_restore_metadata, rp_arn, role_arn)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in _ACCESS_DENIED:
+                hint_lines = [
+                    "GetRecoveryPointRestoreMetadata was denied.",
+                    denied_hint or "Enter a role ARN to assume, or leave blank to skip.",
+                    "",
+                    f"({code})",
+                ]
+                show_message(stdscr, "Access Denied", hint_lines, C_WARN)
+                role_arn = input_text(
+                    stdscr, "Role ARN to assume (blank to skip):", "",
+                    hint="Role needs backup:GetRecoveryPointRestoreMetadata",
+                )
+                if not role_arn:
+                    return {}
+            else:
+                show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+                return None
+        except Exception as e:
+            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+            return None
+
+
 def input_text(stdscr, prompt: str, default: str = "", hint: str = "") -> str:
     """Single-line text input. Blank input returns default."""
     curses.echo()
@@ -1197,24 +1248,10 @@ def workflow_replace_instance(stdscr):
         None,
     )
 
-    try:
-        metadata = run_with_spinner(
-            stdscr, "Fetching restore metadata…", fetch_restore_metadata, rp_arn)
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedException"):
-            show_message(stdscr, "Metadata Unavailable", [
-                "GetRecoveryPointRestoreMetadata was denied.",
-                "Proceeding with metadata built from current instance config.",
-                "",
-                f"({code})",
-            ], C_WARN)
-            metadata = {}
-        else:
-            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
-            return
-    except Exception as e:
-        show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+    metadata = fetch_metadata_interactive(
+        stdscr, rp_arn,
+        "Proceeding with metadata built from current instance config.")
+    if metadata is None:
         return
 
     iam_role = input_text(
@@ -1395,24 +1432,10 @@ def workflow_new_instance_with_eni(stdscr):
         return
     chosen_eni = enis[idx]
 
-    try:
-        metadata = run_with_spinner(
-            stdscr, "Fetching restore metadata…", fetch_restore_metadata, rp_arn)
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedException"):
-            show_message(stdscr, "Metadata Unavailable", [
-                "GetRecoveryPointRestoreMetadata was denied.",
-                "Proceeding with metadata built from ENI/instance type config.",
-                "",
-                f"({code})",
-            ], C_WARN)
-            metadata = {}
-        else:
-            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
-            return
-    except Exception as e:
-        show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+    metadata = fetch_metadata_interactive(
+        stdscr, rp_arn,
+        "Proceeding with metadata built from ENI/instance type config.")
+    if metadata is None:
         return
 
     iam_role = input_text(
@@ -1530,24 +1553,10 @@ def workflow_restore_new_instance(stdscr):
         return
     rp_arn = rp["RecoveryPointArn"]
 
-    try:
-        metadata = run_with_spinner(
-            stdscr, "Fetching restore metadata…", fetch_restore_metadata, rp_arn)
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedException"):
-            show_message(stdscr, "Metadata Unavailable", [
-                "GetRecoveryPointRestoreMetadata was denied.",
-                "You will need to enter SubnetId and Security Group IDs manually.",
-                "",
-                f"({code})",
-            ], C_WARN)
-            metadata = {}
-        else:
-            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
-            return
-    except Exception as e:
-        show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+    metadata = fetch_metadata_interactive(
+        stdscr, rp_arn,
+        "You will need to enter SubnetId and Security Group IDs manually.")
+    if metadata is None:
         return
 
     iam_role = input_text(

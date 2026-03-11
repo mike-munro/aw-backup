@@ -502,6 +502,7 @@ def menu_select(
     detail_fn=None,
     breadcrumb: str = "",
     status_hint: str = "",
+    default_idx: int = 0,
 ) -> int:
     """Scrollable selector with live search and optional detail panel.
 
@@ -511,7 +512,7 @@ def menu_select(
     if not items:
         return -1
 
-    cur = 0
+    cur = max(0, min(default_idx, len(items) - 1))
     offset = 0
     search_active = False
     search_query = ""
@@ -1152,14 +1153,35 @@ def workflow_replace_instance(stdscr):
             f"Launch : {lt_str}",
         ]
 
+    # Pre-select the instance the backup was taken from
+    source_iid = rp.get("ResourceArn", "").split("/")[-1]
+    default_inst_idx = next(
+        (i for i, inst in enumerate(instances) if inst["InstanceId"] == source_iid), 0
+    )
+
     idx = menu_select(
         stdscr, "Select Instance to REPLACE  (will be terminated)",
         instances, format_fn=fmt_inst, detail_fn=detail_inst,
         breadcrumb="Home  ›  Vault  ›  Recovery Point  ›  Target Instance",
+        default_idx=default_inst_idx,
     )
     if idx < 0:
         return
     target = instances[idx]
+
+    # Warn if the selected instance is not the one the backup was made from
+    if target["InstanceId"] != source_iid:
+        source_name = rp.get("ResourceName", "") or source_iid
+        if not confirm_dialog(stdscr, "Instance mismatch — are you sure?", [
+            f"Backup source : {source_iid}  ({source_name})",
+            f"Selected target: {target['InstanceId']}  ({target['Name'] or '(no name)'})",
+            "",
+            "These are different instances. The backup was created from a",
+            "different system than the one you are about to terminate.",
+            "",
+            "Confirm only if you intend to restore across instances.",
+        ]):
+            return
 
     primary_eni = next(
         (ni["NetworkInterfaceId"]

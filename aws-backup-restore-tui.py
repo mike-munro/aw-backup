@@ -89,19 +89,6 @@ class AWSClients:
             self._account_id = self.sts.get_caller_identity()["Account"]
         return self._account_id
 
-    def backup_with_role(self, role_arn: str):
-        """Return a backup client using temporary credentials from an assumed role."""
-        creds = self.sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName="aw-backup-restore-metadata",
-        )["Credentials"]
-        session = boto3.session.Session(
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-        )
-        return session.client("backup", region_name=self._region)
-
 
 aws = AWSClients()
 
@@ -277,10 +264,7 @@ def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
     if tags_raw:
         tag_list = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
         kwargs["Tags"] = {t["Key"]: t["Value"] for t in tag_list}
-    # Assume the service role to make the submission call so that the
-    # CloudShell session identity is not required to have StartRestoreJob.
-    client = aws.backup_with_role(iam_role_arn)
-    resp = client.start_restore_job(**kwargs)
+    resp = aws.backup.start_restore_job(**kwargs)
     return resp["RestoreJobId"]
 
 

@@ -1557,7 +1557,7 @@ def workflow_restore_new_instance(stdscr):
     if not iam_role:
         return
 
-    current_type = (metadata.get("InstanceType")
+    current_type = (metadata.get("InstanceType") or metadata.get("instanceType")
                     or get_source_instance_type(rp.get("ResourceArn", "")))
     inst_type = input_text(
         stdscr, "Instance type:", current_type,
@@ -1566,15 +1566,17 @@ def workflow_restore_new_instance(stdscr):
     if not inst_type:
         return
 
+    # Metadata keys may be PascalCase or camelCase depending on backup version
+    subnet_default = metadata.get("SubnetId") or metadata.get("subnetId", "")
     subnet_id = input_text(
-        stdscr, "SubnetId:", metadata.get("SubnetId", ""),
+        stdscr, "SubnetId:", subnet_default,
         hint="Subnet in which to launch the restored instance",
     )
     if not subnet_id:
         return
 
     sg_default = ""
-    raw_sgs = metadata.get("SecurityGroupIds", "")
+    raw_sgs = metadata.get("SecurityGroupIds") or metadata.get("securityGroupIds", "")
     if raw_sgs:
         try:
             parsed = json.loads(raw_sgs)
@@ -1591,6 +1593,7 @@ def workflow_restore_new_instance(stdscr):
 
     # Remove ENI-related keys that conflict with SubnetId/SecurityGroupIds
     metadata.pop("NetworkInterfaces", None)
+    metadata.pop("networkInterfaces", None)
     metadata["SubnetId"] = subnet_id
     metadata["SecurityGroupIds"] = json.dumps(sg_list)
     metadata["InstanceType"] = inst_type

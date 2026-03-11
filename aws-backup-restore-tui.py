@@ -261,9 +261,14 @@ def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
     return resp["RestoreJobId"]
 
 
-def apply_dr_tags(metadata: Dict, source_tags: List[Dict] = None) -> None:
-    """Populate metadata['Tags'] from source_tags (or existing metadata Tags),
-    prefixing the Name tag value with 'restored-' if not already present."""
+def apply_dr_tags_interactive(stdscr, metadata: Dict, source_tags: List[Dict] = None) -> None:
+    """Interactively configure tags for restore.
+
+    Prompts the user to:
+      1. Keep existing tags (default: yes)
+      2. Set the Name tag for the restored instance (default: restore-<existing name>)
+    """
+    # Resolve the current tag list from metadata or source_tags
     existing = metadata.get("Tags")
     if existing:
         try:
@@ -273,15 +278,39 @@ def apply_dr_tags(metadata: Dict, source_tags: List[Dict] = None) -> None:
     else:
         tags = list(source_tags) if source_tags else []
 
-    for tag in tags:
-        if tag.get("Key") == "Name":
-            val = tag.get("Value", "")
-            if not val.startswith("restored-"):
-                tag["Value"] = f"restored-{val}"
-            break
+    existing_name = next((t["Value"] for t in tags if t.get("Key") == "Name"), "")
+    default_new_name = f"restore-{existing_name}" if existing_name else "restore-"
 
-    if tags:
-        metadata["Tags"] = json.dumps(tags)
+    # Ask whether to keep existing tags
+    keep_answer = input_text(
+        stdscr, "Keep existing tags? [Y/n]:", "y",
+        hint="Press Enter (or y) to keep all existing tags; type n to discard them",
+    )
+    keep_tags = keep_answer.strip().lower() not in ("n", "no")
+
+    final_tags = list(tags) if (keep_tags and tags) else []
+
+    # Ask for the new Name tag value
+    new_name = input_text(
+        stdscr, "Name tag for restored instance:", default_new_name,
+        hint=f"Original name: {existing_name or '(none)'}  │  Leave blank to accept default",
+    )
+
+    if new_name:
+        # Update existing Name tag or add a new one
+        found = False
+        for tag in final_tags:
+            if tag.get("Key") == "Name":
+                tag["Value"] = new_name
+                found = True
+                break
+        if not found:
+            final_tags.append({"Key": "Name", "Value": new_name})
+
+    if final_tags:
+        metadata["Tags"] = json.dumps(final_tags)
+    elif "Tags" in metadata:
+        del metadata["Tags"]
 
 
 def get_restore_job_status(job_id: str) -> Dict:
@@ -1171,7 +1200,7 @@ def workflow_replace_instance(stdscr):
         metadata["IamInstanceProfileName"] = target["IamInstanceProfile"].split("/")[-1]
     if target["KeyName"]:
         metadata["KeyName"] = target["KeyName"]
-    apply_dr_tags(metadata, target.get("Tags", []))
+    apply_dr_tags_interactive(stdscr, metadata, target.get("Tags", []))
 
     rp_ts = rp.get("CreationDate", "")
     rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)
@@ -1379,7 +1408,7 @@ def workflow_new_instance_with_eni(stdscr):
         "NetworkInterfaceId": chosen_eni["NetworkInterfaceId"],
     }])
     metadata["InstanceType"] = inst_type
-    apply_dr_tags(metadata)
+    apply_dr_tags_interactive(stdscr, metadata)
 
     rp_ts = rp.get("CreationDate", "")
     rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)

@@ -1063,8 +1063,8 @@ def select_vault_and_recovery_point(stdscr) -> Optional[Dict]:
     def fmt_group(g: Dict) -> str:
         ts = g["latest"]
         ts_str = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else "?"
-        name_part = f"  {g['name']}" if g["name"] else ""
-        return f"{g['instance_id']}{name_part:<28}  │  {g['count']:>3} points  │  latest {ts_str}"
+        name = g["name"] or "(no name)"
+        return f"{g['instance_id']}  │  {name:<28}  │  {g['count']:>3} points  │  latest {ts_str}"
 
     def detail_group(g: Dict) -> List[str]:
         ts = g["latest"]

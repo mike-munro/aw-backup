@@ -84,6 +84,7 @@ The tool looks up `AWSBackupCustomServiceRole` via IAM and pre-fills the role AR
 - ENI re-attachment in mode 1 uses device index 1 (secondary interface). OS-level routing may be required.
 - ENI attachment in mode 2 uses device index 0 (primary interface).
 - If `GetRecoveryPointRestoreMetadata` is denied, the tool falls back to building metadata from the current instance/ENI configuration.
+- Tags are passed to `StartRestoreJob` via the dedicated `Tags` parameter, not inside `Metadata`, to avoid the AWS `UnknownParameter` error.
 - Restore jobs that are started but not monitored to completion continue running in the background. Check their status with:
 
 ```bash

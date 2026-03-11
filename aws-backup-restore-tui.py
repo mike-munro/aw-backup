@@ -252,12 +252,19 @@ def get_source_instance_type(resource_arn: str, fallback: str = "t3.medium") -> 
 
 
 def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
-    resp = aws.backup.start_restore_job(
+    # AWS does not accept "Tags" inside Metadata — pull it out and pass separately
+    clean_metadata = {k: v for k, v in metadata.items() if k != "Tags"}
+    kwargs: Dict = dict(
         RecoveryPointArn=rp_arn,
-        Metadata=metadata,
+        Metadata=clean_metadata,
         IamRoleArn=iam_role_arn,
         ResourceType="EC2",
     )
+    tags_raw = metadata.get("Tags")
+    if tags_raw:
+        tag_list = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
+        kwargs["Tags"] = {t["Key"]: t["Value"] for t in tag_list}
+    resp = aws.backup.start_restore_job(**kwargs)
     return resp["RestoreJobId"]
 
 

@@ -278,7 +278,10 @@ def start_restore_job(rp_arn: str, metadata: Dict, iam_role_arn: str) -> str:
     if tags_raw:
         tag_list = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
         kwargs["Tags"] = {t["Key"]: t["Value"] for t in tag_list}
-    resp = aws.backup.start_restore_job(**kwargs)
+    # Assume the service role to make the submission call so that the
+    # CloudShell session identity is not required to have StartRestoreJob.
+    client = aws.backup_with_role(iam_role_arn)
+    resp = client.start_restore_job(**kwargs)
     return resp["RestoreJobId"]
 
 

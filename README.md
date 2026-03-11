@@ -5,7 +5,7 @@ A terminal user interface (TUI) for restoring EC2 instances from AWS Backup reco
 ## Features
 
 - Browse backup vaults and recovery points grouped by instance (name resolved from live EC2 tag or backup-time `ResourceName`)
-- Two restore modes (see below)
+- Three restore modes (see below)
 - Target instance pre-selected from backup source; confirmation required if a different instance is chosen
 - Interactive tag configuration before each restore
 - Full-screen restore review before submitting the job
@@ -47,9 +47,22 @@ Restores to a brand-new EC2 instance and attaches a pre-created available ENI as
 5. Configure tags (see [Tag configuration](#tag-configuration))
 6. Review full restore plan → confirm
 
+### 3 — Restore New Instance (Subnet + SG)
+
+Restores to a brand-new EC2 instance using a subnet and security groups — no pre-created ENI required. AWS Backup creates a new primary ENI in the specified subnet. Use this mode when the original instance has already been terminated and no `available` ENI exists.
+
+**Steps:**
+1. Select backup vault → instance → recovery point
+2. Enter IAM role ARN
+3. Confirm or change instance type
+4. Confirm or enter subnet ID
+5. Confirm or enter security group IDs (comma-separated)
+6. Configure tags (see [Tag configuration](#tag-configuration))
+7. Review full restore plan → confirm
+
 ## Tag Configuration
 
-During both restore workflows, you are prompted to configure tags before the restore job is submitted:
+During all restore workflows, you are prompted to configure tags before the restore job is submitted:
 
 | Prompt | Default | Description |
 |--------|---------|-------------|
@@ -83,6 +96,7 @@ The tool looks up `AWSBackupCustomServiceRole` via IAM and pre-fills the role AR
 - Termination in mode 1 is irreversible — review the restore plan carefully before confirming.
 - ENI re-attachment in mode 1 uses device index 1 (secondary interface). OS-level routing may be required.
 - ENI attachment in mode 2 uses device index 0 (primary interface).
+- Mode 3 lets AWS Backup create a new ENI in the chosen subnet; useful when the original instance is gone and no available ENI exists.
 - If `GetRecoveryPointRestoreMetadata` is denied, the tool falls back to building metadata from the current instance/ENI configuration.
 - Tags are passed to `StartRestoreJob` via the dedicated `Tags` parameter, not inside `Metadata`, to avoid the AWS `UnknownParameter` error.
 - Restore jobs that are started but not monitored to completion continue running in the background. Check their status with:

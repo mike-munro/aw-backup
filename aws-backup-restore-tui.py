@@ -1515,6 +1515,153 @@ def workflow_new_instance_with_eni(stdscr):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Mode 3 – Restore new instance (subnet + SG, no ENI required)
+# ──────────────────────────────────────────────────────────────────────
+
+def workflow_restore_new_instance(stdscr):
+    """Restore to a brand-new EC2 using SubnetId + SecurityGroupIds from metadata.
+
+    No pre-created ENI is needed — AWS Backup creates a new primary ENI in the
+    specified subnet.  Useful when the original instance has been terminated and
+    no available ENI exists.
+    """
+    rp = select_vault_and_recovery_point(stdscr)
+    if rp is None:
+        return
+    rp_arn = rp["RecoveryPointArn"]
+
+    try:
+        metadata = run_with_spinner(
+            stdscr, "Fetching restore metadata…", fetch_restore_metadata, rp_arn)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedException"):
+            show_message(stdscr, "Metadata Unavailable", [
+                "GetRecoveryPointRestoreMetadata was denied.",
+                "You will need to enter SubnetId and Security Group IDs manually.",
+                "",
+                f"({code})",
+            ], C_WARN)
+            metadata = {}
+        else:
+            show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+            return
+    except Exception as e:
+        show_message(stdscr, "Error", [f"Failed to get metadata: {e}"], C_ERROR)
+        return
+
+    iam_role = input_text(
+        stdscr, "IAM Role ARN for restore:", get_default_restore_role_arn(),
+        hint="Role must have AWS Backup restore permissions",
+    )
+    if not iam_role:
+        return
+
+    current_type = (metadata.get("InstanceType")
+                    or get_source_instance_type(rp.get("ResourceArn", "")))
+    inst_type = input_text(
+        stdscr, "Instance type:", current_type,
+        hint=f"Backup was originally: {current_type}",
+    )
+    if not inst_type:
+        return
+
+    subnet_id = input_text(
+        stdscr, "SubnetId:", metadata.get("SubnetId", ""),
+        hint="Subnet in which to launch the restored instance",
+    )
+    if not subnet_id:
+        return
+
+    sg_default = ""
+    raw_sgs = metadata.get("SecurityGroupIds", "")
+    if raw_sgs:
+        try:
+            parsed = json.loads(raw_sgs)
+            sg_default = ",".join(parsed) if isinstance(parsed, list) else raw_sgs
+        except (json.JSONDecodeError, TypeError):
+            sg_default = raw_sgs
+    sg_input = input_text(
+        stdscr, "Security Group IDs (comma-separated):", sg_default,
+        hint="e.g. sg-0123456789abcdef0,sg-abcdef01",
+    )
+    if not sg_input:
+        return
+    sg_list = [s.strip() for s in sg_input.split(",") if s.strip()]
+
+    # Remove ENI-related keys that conflict with SubnetId/SecurityGroupIds
+    metadata.pop("NetworkInterfaces", None)
+    metadata["SubnetId"] = subnet_id
+    metadata["SecurityGroupIds"] = json.dumps(sg_list)
+    metadata["InstanceType"] = inst_type
+
+    apply_dr_tags_interactive(stdscr, metadata)
+
+    rp_ts = rp.get("CreationDate", "")
+    rp_ts_str = rp_ts.strftime("%Y-%m-%d %H:%M UTC") if hasattr(rp_ts, "strftime") else str(rp_ts)
+    rp_size = rp.get("BackupSizeInBytes", 0)
+    rp_size_str = (f"{rp_size // (1024**3)} GB" if rp_size >= 1024**3
+                   else f"{rp_size // (1024**2)} MB" if rp_size else "unknown")
+
+    sections = [
+        ("RECOVERY POINT", [
+            ("ARN",            rp_arn),
+            ("Vault",          vault_name_from_rp_arn(rp_arn)),
+            ("Created",        rp_ts_str),
+            ("Size",           rp_size_str),
+            ("Status",         rp.get("Status", "?")),
+            ("Encrypted",      "Yes" if rp.get("IsEncrypted") else "No"),
+        ]),
+        ("RESTORE SETTINGS", [
+            ("IAM Role ARN",   iam_role),
+            ("Instance Type",  inst_type),
+            ("Subnet ID",      subnet_id),
+            ("Security Groups", ", ".join(sg_list)),
+            ("Tags",           metadata.get("Tags", "(none)")),
+        ]),
+    ]
+
+    if not show_restore_review(stdscr, "NEW INSTANCE (subnet + SG)", sections, metadata):
+        return
+
+    try:
+        job_id = run_with_spinner(stdscr, "Starting restore job…",
+                                  start_restore_job, rp_arn, metadata, iam_role)
+    except Exception as e:
+        show_message(stdscr, "Restore Failed", [f"Error: {e}"], C_ERROR)
+        return
+
+    _restore_jobs.append({
+        "id": job_id,
+        "started": datetime.now().strftime("%H:%M:%S"),
+        "mode": "new+subnet",
+        "status": "RUNNING",
+    })
+
+    result = poll_restore_job(stdscr, job_id)
+    if result:
+        _restore_jobs[-1]["status"] = result.get("Status", "?")
+
+    if result and result.get("Status") == "COMPLETED":
+        created_arn = result.get("CreatedResourceArn", "")
+        new_iid = created_arn.split("/")[-1] if "/" in created_arn else ""
+        if new_iid:
+            show_message(stdscr, "Restore Complete!", [
+                f"New instance : {new_iid}",
+                f"Subnet       : {subnet_id}",
+                f"Sec Groups   : {', '.join(sg_list)}",
+                "",
+                "A new primary ENI was created in the specified subnet.",
+            ], C_SUCCESS)
+        else:
+            show_message(stdscr, "Restore Complete", [
+                "Job completed but could not extract instance ID.",
+                f"Job ID: {job_id}",
+                "Check the AWS Console for the restored instance.",
+            ], C_STATUS)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Help and session job history
 # ──────────────────────────────────────────────────────────────────────
 
@@ -1533,7 +1680,8 @@ def show_help(stdscr):
         "Main menu",
         "  1   Replace existing instance",
         "  2   Restore new instance + ENI",
-        "  3   View session job history",
+        "  3   Restore new instance (subnet + SG, no ENI needed)",
+        "  4   View session job history",
         "  ?   Show this help screen",
         "  q   Quit",
         "",
@@ -1563,7 +1711,9 @@ MAIN_MENU = [
      "Terminate current EC2, restore from backup, re-attach ENI to preserve IP"),
     ("2", "Restore New Instance + ENI",
      "Restore to a brand-new EC2 and attach a pre-created available ENI"),
-    ("3", "Session Job History",
+    ("3", "Restore New Instance (Subnet + SG)",
+     "Restore to a new EC2 using subnet/SG from metadata — no pre-created ENI needed"),
+    ("4", "Session Job History",
      "View restore jobs started in this session"),
     ("?", "Help / Keyboard Shortcuts",
      "Show navigation and shortcut reference"),
@@ -1607,7 +1757,7 @@ def draw_main_menu(stdscr, selected: int, account_id: str):
             safe_addstr(stdscr, row + 1, 12, desc, curses.color_pair(C_DIM))
 
     draw_status_bar(stdscr,
-                    "↑/↓ Navigate  │  Enter Select  │  1/2/3 Shortcut  │  ? Help  │  q Quit")
+                    "↑/↓ Navigate  │  Enter Select  │  1/2/3/4 Shortcut  │  ? Help  │  q Quit")
     stdscr.refresh()
 
 
@@ -1658,6 +1808,8 @@ def main(stdscr):
             elif choice == "2":
                 workflow_new_instance_with_eni(stdscr)
             elif choice == "3":
+                workflow_restore_new_instance(stdscr)
+            elif choice == "4":
                 show_session_jobs(stdscr)
             elif choice == "?":
                 show_help(stdscr)
@@ -1668,6 +1820,8 @@ def main(stdscr):
         elif key == ord("2"):
             workflow_new_instance_with_eni(stdscr)
         elif key == ord("3"):
+            workflow_restore_new_instance(stdscr)
+        elif key == ord("4"):
             show_session_jobs(stdscr)
         elif key == ord("?"):
             show_help(stdscr)

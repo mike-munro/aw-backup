@@ -4,8 +4,9 @@ A terminal user interface (TUI) for restoring EC2 instances from AWS Backup reco
 
 ## Features
 
-- Browse backup vaults and recovery points grouped by instance
+- Browse backup vaults and recovery points grouped by instance (name resolved from live EC2 tag or backup-time `ResourceName`)
 - Two restore modes (see below)
+- Target instance pre-selected from backup source; confirmation required if a different instance is chosen
 - Interactive tag configuration before each restore
 - Full-screen restore review before submitting the job
 - Live restore job progress monitor
@@ -29,7 +30,7 @@ Terminates a running/stopped EC2 instance and restores it from a backup recovery
 
 **Steps:**
 1. Select backup vault → instance → recovery point
-2. Select the target instance to terminate
+2. Select the target instance to terminate — the backup's source instance is pre-selected; choosing a different instance shows a confirmation warning
 3. Enter IAM role ARN (defaults to `AWSBackupCustomServiceRole`)
 4. Configure tags (see [Tag configuration](#tag-configuration))
 5. Review full restore plan → confirm
